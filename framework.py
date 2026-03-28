@@ -1,74 +1,83 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import os
+import math
+from openai import OpenAI
 
-def true_dola_classifier(
-    prompt: str, 
-    target_token_str: str, 
-    model_name: str = "gpt2", 
-    early_layer_idx: int = 2
-):
+# Initialize OpenAI Client (Ensure your OPENAI_API_KEY is set in your environment)
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+def get_classification_logprob(prompt: str, persona_system_prompt: str, target_token: str, model="gpt-4o-mini"):
     """
-    Implements true Decoding by Contrasting Layers (DoLa).
-    Subtracts early-layer logits (reflex/bias) from late-layer logits (context/reasoning).
-    
-    Args:
-        prompt (str): The input text to analyze.
-        target_token_str (str): The token we are scoring (e.g., "Yes", "Positive").
-        model_name (str): HuggingFace model ID. (Using 'gpt2' for accessibility, but 
-                          works best on modern models like 'meta-llama/Llama-2-7b-hf').
-        early_layer_idx (int): The index of the layer to treat as the "naive reflex".
+    Calls the LLM with a specific persona and retrieves the log probability of the target token.
     """
-    print(f"Loading {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
-    model.eval() # Set to evaluation mode
-
-    # 1. Prepare Inputs
-    inputs = tokenizer(prompt, return_tensors="pt")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": persona_system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=1, # We only want the classification token
+        logprobs=True,
+        top_logprobs=5,
+        temperature=0.0
+    )
     
-    # Ensure the target token is a single token in the model's vocabulary
-    target_token_id = tokenizer.encode(target_token_str)[0]
-
-    with torch.no_grad():
-        # 2. Forward pass, extracting hidden states from ALL layers
-        outputs = model(**inputs)
+    # Extract the logprobs from the first token of the response
+    logprobs_list = response.choices[0].logprobs.content[0].top_logprobs
+    
+    # Search for our target token's logprob
+    target_logprob = None
+    for lp in logprobs_list:
+        if lp.token.strip().lower() == target_token.lower():
+            target_logprob = lp.logprob
+            break
+            
+    # If the token wasn't in the top 5, assign a heavily penalized logprob
+    if target_logprob is None:
+        target_logprob = -10.0 
         
-        # 'hidden_states' is a tuple of (embedding_output, layer_1, layer_2, ..., final_layer)
-        hidden_states = outputs.hidden_states
-        
-        # 3. Extract the Early Layer (The "Naive Reflex" / Egocentric State)
-        # We take the state from the specified early layer, looking at the LAST token in the prompt
-        early_hidden_state = hidden_states[early_layer_idx][0, -1, :]
-        
-        # 4. Extract the Late Layer (The "Expert Reasoning" / Theory of Mind State)
-        # We take the final transformer layer (index -1)
-        late_hidden_state = hidden_states[-1][0, -1, :]
+    # Convert logprob to actual probability for display purposes
+    probability = math.exp(target_logprob)
+    
+    return target_logprob, probability
 
-        # 5. Project hidden states into Vocabulary Logits
-        # Models use an 'lm_head' (Language Modeling Head) to map hidden states back to words
-        # Note: Depending on the architecture, you might need to apply LayerNorm here.
-        # GPT-2's lm_head can take the hidden state directly.
-        early_logits = model.lm_head(early_hidden_state)
-        late_logits = model.lm_head(late_hidden_state)
+def dola_classifier(input_text: str, candidate_label: str):
+    """
+    Runs the 'Council of Minds' DoLa SP Algorithm.
+    """
+    # 1. Define the Personas based on the AICRAFT text
+    naive_prompt = "You are a naive guesser. Rely on your first instinct and superficial surface-level associations. Classify the following text with a single word." # [cite: 151]
+    expert_prompt = "You are a careful reasoner. Analyze the deep logic, intent, context, and subtle nuances of the text. Classify the following text with a single word." # [cite: 153]
 
-        # 6. Extract the logit specifically for our target token
-        early_target_logit = early_logits[target_token_id].item()
-        late_target_logit = late_logits[target_token_id].item()
+    user_prompt = f"Text: '{input_text}'\nIs the core sentiment or intent here '{candidate_label}'? Answer only with 'Yes' or 'No'."
+    target_token = "Yes"
 
-        # 7. THE DOLA OPERATION: Subtract Reflex from Reasoning
-        # This isolates the higher-order contextual features from raw statistical bias.
-        dola_score = late_target_logit - early_target_logit
+    print(f"\n--- Analyzing: '{input_text}' for label '{candidate_label}' ---")
 
-    # Output the analytical breakdown
-    print(f"\n--- True DoLa Analysis for token: '{target_token_str}' ---")
-    print(f"Early Layer [{early_layer_idx}] Logit (Reflex):   {early_target_logit:.4f}")
-    print(f"Late Layer [Final] Logit (Reasoning): {late_target_logit:.4f}")
-    print(f"DoLa Score (Late - Early):            {dola_score:.4f}\n")
+    # 2. Get Naive (Early Layer Analogue) Logprobs
+    naive_logprob, naive_prob = get_classification_logprob(user_prompt, naive_prompt, target_token)
+    
+    # 3. Get Expert (Late Layer Analogue) Logprobs
+    expert_logprob, expert_prob = get_classification_logprob(user_prompt, expert_prompt, target_token)
+
+    # 4. Calculate DoLa Score (Expert - Naive)
+    dola_score = expert_logprob - naive_logprob
+
+    # 5. Output Results formatting matching the DoLa Classifier Table
+    print(f"Naive State (Reflex): {naive_prob*100:.2f}% (Logprob: {naive_logprob:.2f})")
+    print(f"Expert State (Reason): {expert_prob*100:.2f}% (Logprob: {expert_logprob:.2f})")
+    print(f"DoLa Score (Logit Diff): {dola_score:.2f}")
     
     if dola_score > 0:
-        print("Conclusion: GAIN. The later layers actively promoted this token over the reflex.")
+        print("Interpretation: GAIN (True Signal / Hidden Truth) - The expert actively promoted this.") # [cite: 233, 246]
     else:
-        print("Conclusion: INHIBITION. The later layers actively suppressed the initial reflex.")
+        print("Interpretation: LOSS (Suppressed Bias) - The expert actively suppressed this initial reflex.") # [cite: 233, 246]
 
-# Example Usage:
-# true_dola_classifier("The bank is completely flooded. Is this a financial institution? Answer: ", "Yes", early_layer_idx=2)
+# --- Run the tests from the document ---
+if __name__ == "__main__":
+    # Test 1: The Sarcastic/Figurative Idiom
+    dola_classifier("I'm dying to meet you!", "Emergency") # [cite: 233, 246]
+    dola_classifier("I'm dying to meet you!", "Excitement") # [cite: 233, 246]
+
+    # Test 2: The Contextual Shift
+    dola_classifier("The bank is completely flooded.", "Financial Institution") # [cite: 246]
+    dola_classifier("The bank is completely flooded.", "River Bank") # [cite: 246]
