@@ -1,0 +1,93 @@
+import os
+import math
+import asyncio
+from mcp.server.fastmcp import FastMCP
+from openai import AsyncOpenAI
+
+# Initialize the FastMCP Server
+# This automatically handles the JSON-RPC communication over standard I/O streams
+mcp = FastMCP("DoLa_Council_Server")
+
+# Initialize the Asynchronous OpenAI Client
+client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+async def get_classification_logprob(prompt: str, persona_system_prompt: str, target_token: str, model="gpt-4o-mini"):
+    """
+    Helper function: Makes an async call to the LLM to fetch logprobs for a specific persona.
+    """
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": persona_system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=1, 
+        logprobs=True,
+        top_logprobs=5,
+        temperature=0.0
+    )
+    
+    logprobs_list = response.choices[0].logprobs.content[0].top_logprobs
+    
+    target_logprob = None
+    for lp in logprobs_list:
+        if lp.token.strip().lower() == target_token.lower():
+            target_logprob = lp.logprob
+            break
+            
+    if target_logprob is None:
+        target_logprob = -10.0 # Heavy penalty if the token isn't even in the top 5
+        
+    return target_logprob, math.exp(target_logprob)
+
+# The @mcp.tool() decorator registers this function as an available tool to the connecting LLM.
+@mcp.tool()
+async def dola_analyze(input_text: str, candidate_label: str) -> str:
+    """
+    Analyzes text using the DoLa (Decoding by Contrasting Layers) Multi-Persona approach.
+    Use this tool to determine if an assumption about a text is a superficial reflex 
+    or a deeply reasoned truth (Theory of Mind).
+    
+    Args:
+        input_text: The sentence or paragraph to analyze.
+        candidate_label: A specific label or sentiment to test (e.g., 'Sarcasm', 'Emergency').
+    """
+    # 1. Define Personas
+    naive_prompt = "You are a naive guesser. Rely on your first instinct and superficial surface-level associations. Classify the following text with a single word."
+    expert_prompt = "You are a careful reasoner. Analyze the deep logic, intent, context, and subtle nuances of the text. Classify the following text with a single word."
+
+    user_prompt = f"Text: '{input_text}'\nIs the core sentiment or intent here '{candidate_label}'? Answer only with 'Yes' or 'No'."
+    target_token = "Yes"
+
+    # 2. Run both persona calls concurrently using asyncio.gather for speed
+    naive_task = get_classification_logprob(user_prompt, naive_prompt, target_token)
+    expert_task = get_classification_logprob(user_prompt, expert_prompt, target_token)
+    
+    (naive_logprob, naive_prob), (expert_logprob, expert_prob) = await asyncio.gather(naive_task, expert_task)
+
+    # 3. Compute DoLa
+    dola_score = expert_logprob - naive_logprob
+
+    # 4. Formulate the response string that the LLM Agent will read
+    interpretation = (
+        "GAIN (True Signal) - The expert reasoning promoted this concept." 
+        if dola_score > 0 else 
+        "LOSS (Suppressed Bias) - The expert reasoning actively suppressed this initial reflex."
+    )
+
+    report = (
+        f"--- DoLa Analysis Report ---\n"
+        f"Input: '{input_text}'\n"
+        f"Testing Label: '{candidate_label}'\n\n"
+        f"Naive State (Reflex): {naive_prob*100:.2f}% (Logprob: {naive_logprob:.2f})\n"
+        f"Expert State (Reason): {expert_prob*100:.2f}% (Logprob: {expert_logprob:.2f})\n"
+        f"DoLa Score (Logit Diff): {dola_score:.2f}\n"
+        f"Interpretation: {interpretation}"
+    )
+    
+    return report
+
+if __name__ == "__main__":
+    # Start the MCP server. 
+    # When run as a script, it listens on standard input/output for MCP protocol messages.
+    mcp.run()
